@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+Advanced OCR Text Detection Module
+--------------------------------
+This module provides functionality for detecting and extracting text from images
+using computer vision techniques and Tesseract OCR engine.
+
+Author: Olzhas Alseitov
+License: MIT
+"""
+
+import cv2
+import numpy as np
+import pytesseract
+import os
+import sys
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+from pathlib import Path
+
+# Type aliases
+Coordinates = Tuple[int, int, int, int]
+OCRResult = Tuple[Coordinates, str]
+
+@dataclass
+class OCRConfig:
+    """Configuration settings for OCR processing."""
+    tesseract_cmd: str = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    languages: str = 'rus+eng+kaz'
+    oem_mode: int = 1
+    psm_mode: int = 6
+    min_contour_width: int = 20
+    min_contour_height: int = 20
+    kernel_width: int = 20
+    kernel_height: int = 5
+    dilation_iterations: int = 5
+    debug_mode: bool = False
+
+@dataclass
+class ImageProcessingConfig:
+    """Configuration for image preprocessing."""
+    denoise_h: int = 10
+    denoise_template_window: int = 7
+    denoise_search_window: int = 21
+    adaptive_block_size: int = 11
+    adaptive_c: int = 2
+
+class OCRProcessor:
+    """Main class for handling OCR processing operations."""
+    
+    def __init__(
+        self,
+        ocr_config: OCRConfig = OCRConfig(),
+        img_config: ImageProcessingConfig = ImageProcessingConfig(),
+        logger: Optional[logging.Logger] = None
+    ):
+        """Initialize OCR processor with configurations."""
+        self.ocr_config = ocr_config
+        self.img_config = img_config
+        self.logger = logger or self._setup_logger()
+        
+        # Configure Tesseract path
+        pytesseract.pytesseract.tesseract_cmd = ocr_config.tesseract_cmd
+        
+        self._validate_configurations()
+
+    @staticmethod
+    def _setup_logger() -> logging.Logger:
+        """Set up and configure logger."""
+        logger = logging.getLogger(__name__)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+        return logger
+
+    def _validate_configurations(self) -> None:
+        """Validate configuration parameters."""
+        if not os.path.exists(self.ocr_config.tesseract_cmd):
+            raise ValueError(f"Tesseract not found at: {self.ocr_config.tesseract_cmd}")
+
+    def load_image(self, image_path: str) -> np.ndarray:
+        """
+        Load image from specified path.
+        
+        Args:
+            image_path: Path to the image file
+            
+        Returns:
+            numpy.ndarray: Loaded image
+            
+        Raises:
+            FileNotFoundError: If image cannot be loaded
+        """
+        img = cv2.imread(str(Path(image_path)))
+        if img is None:
+            raise FileNotFoundError(f"Failed to load image at path: {image_path}")
+        return img
+
+    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """
+        Apply preprocessing steps to the image.
+        
+        Args:
+            image: Input image array
+            
+        Returns:
+            numpy.ndarray: Preprocessed binary image
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.fastNlMeansDenoising(
+            gray,
+            None,
+            self.img_config.denoise_h,
+            self.img_config.denoise_template_window,
+            self.img_config.denoise_search_window
+        )
+        binary = cv2.adaptiveThreshold(
+            denoised,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            self.img_config.adaptive_block_size,
+            self.img_config.adaptive_c
+        )
+        return binary
+
+    def detect_text_regions(self, binary_image: np.ndarray) -> List[Coordinates]:
+        """
+        Detect potential text regions in the binary image.
+        
+        Args:
+            binary_image: Preprocessed binary image
+            
+        Returns:
+            List of coordinates for detected text regions
+        """
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (self.ocr_config.kernel_width, self.ocr_config.kernel_height)
+        )
+        dilated = cv2.dilate(binary_image, kernel, 
+                            iterations=self.ocr_config.dilation_iterations)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, 
+                                     cv2.CHAIN_APPROX_SIMPLE)
+        
+        rectangles = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if (w > self.ocr_config.min_contour_width and 
+                h > self.ocr_config.min_contour_height):
+                rectangles.append((x, y, x+w, y+h))
+        
+        return rectangles
+
+    def _ocr_on_box(self, args: Tuple[np.ndarray, Coordinates]) -> Optional[OCRResult]:
+        """
+        Perform OCR on a specific region of the image.
+        
+        Args:
+            args: Tuple containing image array and coordinates
+            
+        Returns:
+            Optional tuple containing coordinates and detected text
+        """
+        image, (start_x, start_y, end_x, end_y) = args
+        roi = image[start_y:end_y, start_x:end_x]
+        
+        config = (f"--oem {self.ocr_config.oem_mode} "
+                 f"--psm {self.ocr_config.psm_mode} "
+                 f"-l {self.ocr_config.languages}")
+        
+        try:
+            text = pytesseract.image_to_string(roi, config=config)
+            if text.strip():
+                return ((start_x, start_y, end_x, end_y), text.strip())
+        except Exception as e:
+            self.logger.error(f"OCR error in region {(start_x, start_y, end_x, end_y)}: {e}")
+        
+        return None
+
+    def process_image(
+        self,
+        image_path: str,
+        output_path: Optional[str] = None,
+        save_debug: bool = False
+    ) -> Tuple[List[OCRResult], np.ndarray]:
+        """
+        Process image and extract text.
+        
+        Args:
+            image_path: Path to input image
+            output_path: Optional path to save annotated image
+            save_debug: Whether to save debug images
+            
+        Returns:
+            Tuple containing list of OCR results and processed image
+        """
+        try:
+            image = self.load_image(image_path)
+            binary = self.preprocess_image(image)
+            rectangles = self.detect_text_regions(binary)
+            
+            with ThreadPoolExecutor() as executor:
+                results = list(filter(None, executor.map(
+                    self._ocr_on_box,
+                    [(image, rect) for rect in rectangles]
+                )))
+            
+            # Draw rectangles on image
+            processed_image = image.copy()
+            for ((start_x, start_y, end_x, end_y), _) in results:
+                cv2.rectangle(
+                    processed_image,
+                    (start_x, start_y),
+                    (end_x, end_y),
+                    (0, 255, 0),
+                    2
+                )
+            
+            if output_path:
+                cv2.imwrite(output_path, processed_image)
+                
+            if save_debug:
+                debug_path = os.path.join(
+                    os.path.dirname(output_path),
+                    'debug_binary.jpg'
+                )
+                cv2.imwrite(debug_path, binary)
+            
+            return results, processed_image
+            
+        except Exception as e:
+            self.logger.error(f"Image processing error: {e}", exc_info=True)
+            raise
+
+    @staticmethod
+    def save_results(
+        results: List[OCRResult],
+        output_file: str,
+        encoding: str = 'utf-8'
+    ) -> None:
+        """
+        Save OCR results to a text file.
+        
+        Args:
+            results: List of OCR results
+            output_file: Path to output file
+            encoding: Text encoding to use
+        """
+        with open(output_file, 'w', encoding=encoding) as f:
+            for ((start_x, start_y, end_x, end_y), text) in results:
+                f.write(
+                    f"Coordinates: ({start_x}, {start_y}, {end_x}, {end_y})\n"
+                    f"Text: {text}\n\n"
+                )
+
+def main():
+    """Main function for command line usage."""
+    # Example usage
+    ocr_config = OCRConfig(debug_mode=True)
+    img_config = ImageProcessingConfig()
+    processor = OCRProcessor(ocr_config, img_config)
+    
+    image_path = 'path/to/your/image.jpg'
+    output_path = 'path/to/output/image.jpg'
+    results_file = 'path/to/output/results.txt'
+    
+    try:
+        results, processed = processor.process_image(
+            image_path,
+            output_path,
+            save_debug=True
+        )
+        processor.save_results(results, results_file)
+        
+        processor.logger.info(f"Processed image saved as: {output_path}")
+        processor.logger.info(f"Number of text regions detected: {len(results)}")
+        processor.logger.info(f"Results saved to: {results_file}")
+        
+    except Exception as e:
+        processor.logger.error(f"Processing failed: {e}", exc_info=True)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
