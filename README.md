@@ -59,7 +59,7 @@ results, processed_image = process_image(
 
 2. Command line usage (upcoming feature):
 ```bash
-python east_ocr_adv.py --input path/to/image.jpg --output path/to/output.jpg
+python app.py --input path/to/image.jpg --output path/to/output.jpg
 ```
 
 ## Output
@@ -82,7 +82,7 @@ You can modify the following parameters in the script:
 ```
 advanced-ocr-detection/
 │
-├── east_ocr_adv.py        # Main script
+├── app.py                # Main script
 ├── requirements.txt       # Python dependencies
 ├── README.md             # Project documentation
 ├── .gitignore           # Git ignore file
